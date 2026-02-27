@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VRoute V2Ray (VLESS) Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', system-ui, sans-serif; padding: 24px; }
+  h1 { color: #58a6ff; font-size: 28px; margin-bottom: 8px; }
+  h2 { color: #79c0ff; font-size: 20px; margin: 32px 0 16px; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+  h3 { color: #d2a8ff; font-size: 16px; margin: 20px 0 8px; }
+  .subtitle { color: #8b949e; margin-bottom: 24px; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px; margin-bottom: 24px; }
+  .diagram { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 20px; margin: 16px 0; overflow-x: auto; }
+  .diagram pre { color: #e6edf3; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; line-height: 1.5; white-space: pre; }
+  .highlight { color: #ffa657; }
+  .green { color: #3fb950; }
+  .blue { color: #58a6ff; }
+  .purple { color: #d2a8ff; }
+  .red { color: #f85149; }
+  .cyan { color: #39d353; }
+  .gray { color: #8b949e; }
+  .yellow { color: #e3b341; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; }
+  th { background: #21262d; color: #79c0ff; }
+  td { background: #161b22; }
+  code { background: #21262d; padding: 2px 6px; border-radius: 4px; font-family: 'Cascadia Code', monospace; font-size: 13px; color: #ffa657; }
+  .note { background: #1c2128; border-left: 3px solid #e3b341; padding: 12px 16px; margin: 12px 0; border-radius: 0 4px 4px 0; }
+  .note-danger { border-left-color: #f85149; }
+  .note-info { border-left-color: #58a6ff; }
+  .tabs { display: flex; gap: 0; margin-bottom: 0; }
+  .tab { padding: 8px 20px; background: #21262d; border: 1px solid #30363d; cursor: pointer; color: #8b949e; font-size: 14px; }
+  .tab:first-child { border-radius: 8px 0 0 0; }
+  .tab:last-child { border-radius: 0 8px 0 0; }
+  .tab.active { background: #161b22; color: #58a6ff; border-bottom-color: #161b22; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+</style>
+</head>
+<body>
+
+<h1>VRoute V2Ray (VLESS) Architecture</h1>
+<p class="subtitle">How VLESS integrates with the existing 5-protocol VPN infrastructure</p>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>1. Protocol Overview — All 6 Protocols</h2>
+<table>
+  <tr>
+    <th>Protocol</th><th>Port</th><th>Transport</th><th>Interface</th><th>Subnet</th><th>Auth</th><th>ID Base</th>
+  </tr>
+  <tr><td>WireGuard</td><td>11040</td><td>UDP</td><td>wg0</td><td>10.1.0.0/16</td><td>DB sync (pubkey)</td><td>500</td></tr>
+  <tr><td>OpenVPN TCP</td><td>11041</td><td>TCP</td><td>tun0</td><td>10.2.0.0/16</td><td>RADIUS</td><td>600</td></tr>
+  <tr><td>OpenVPN UDP</td><td>11041</td><td>UDP</td><td>tun1</td><td>10.3.0.0/16</td><td>RADIUS</td><td>600</td></tr>
+  <tr><td>IKEv2</td><td>500+4500</td><td>UDP+ESP</td><td>xfrm</td><td>10.4.0.0/16</td><td>RADIUS (EAP)</td><td>700</td></tr>
+  <tr><td>ocserv</td><td>443</td><td>TCP+UDP</td><td>vpns*</td><td>10.5.0.0/16</td><td>RADIUS</td><td>300</td></tr>
+  <tr><td>L2TP</td><td>1701</td><td>UDP</td><td>ppp*</td><td>10.6.0.0/24</td><td>RADIUS (PPP)</td><td>400</td></tr>
+  <tr style="background:#1c2128"><td><b>V2RAY (VLESS)</b></td><td><b>11042</b></td><td><b>TCP</b></td><td><b>proxy (no iface)</b></td><td><b>N/A (proxy)</b></td><td><b>DB sync (UUID)</b></td><td><b>800</b></td></tr>
+</table>
+
+<div class="note note-info">
+  <b>Key difference:</b> V2RAY is a <b>proxy</b>, not a tunnel. There's no virtual network interface or VPN IP assigned.
+  Xray receives client connections, then makes outbound connections on behalf of the client. The client's traffic appears
+  to come from the server's IP (or vrtun0 tunnel IP if routed through tunnel).
+</div>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>2. V2Ray Connection Flow</h2>
+<div class="diagram"><pre>
+<span class="blue">┌─────────────┐</span>      TCP:11042         <span class="green">┌──────────────────────────────┐</span>
+<span class="blue">│   Client    │</span>  ──────────────────►  <span class="green">│       Xray (VLESS)           │</span>
+<span class="blue">│  v2rayNG /  │</span>  HTTP obfuscation    <span class="green">│                              │</span>
+<span class="blue">│  v2rayN     │</span>  Host: bale.ai       <span class="green">│  Inbound: vless-in (:11042)  │</span>
+<span class="blue">│             │</span>                      <span class="green">│  Auth: UUID per user         │</span>
+<span class="blue">└─────────────┘</span>                      <span class="green">│  Stats: per-user tracking    │</span>
+                                      <span class="green">│                              │</span>
+                                      <span class="green">│  Outbound: freedom           │</span>
+                                      <span class="green">│  sockopt.mark = 0x2          │</span>
+                                      <span class="green">└──────────┬───────────────────┘</span>
+                                                 │
+                                                 │ fwmark 0x2
+                                                 ▼
+                                      <span class="yellow">┌──────────────────────────────┐</span>
+                                      <span class="yellow">│    nftables prerouting       │</span>
+                                      <span class="yellow">│                              │</span>
+                                      <span class="yellow">│  if dst in @bypass set:      │</span>
+                                      <span class="yellow">│    mark → 0x1 (direct)       │</span>
+                                      <span class="yellow">│  else:                       │</span>
+                                      <span class="yellow">│    keep mark 0x2 (tunnel)    │</span>
+                                      <span class="yellow">└──────────┬───────────────────┘</span>
+                                                 │
+                                    ┌────────────┴────────────┐
+                                    │                         │
+                             mark = 0x2                mark = 0x1
+                             (foreign dst)             (bypass/Iranian dst)
+                                    │                         │
+                                    ▼                         ▼
+                         <span class="purple">┌──────────────────┐</span>    <span class="cyan">┌──────────────────┐</span>
+                         <span class="purple">│ ip rule fwmark 2 │</span>    <span class="cyan">│ ip rule fwmark 1 │</span>
+                         <span class="purple">│ table: tunnel    │</span>    <span class="cyan">│ table: main      │</span>
+                         <span class="purple">│                  │</span>    <span class="cyan">│                  │</span>
+                         <span class="purple">│ via 10.99.99.1   │</span>    <span class="cyan">│ via ens160/ens34  │</span>
+                         <span class="purple">│ dev vrtun0       │</span>    <span class="cyan">│ (direct)         │</span>
+                         <span class="purple">└────────┬─────────┘</span>    <span class="cyan">└────────┬─────────┘</span>
+                                  │                           │
+                                  ▼                           ▼
+                         <span class="purple">┌──────────────────┐</span>    <span class="cyan">┌──────────────────┐</span>
+                         <span class="purple">│  Tunnel Server   │</span>    <span class="cyan">│   Internet       │</span>
+                         <span class="purple">│  (10.99.99.1)    │</span>    <span class="cyan">│   (direct path)  │</span>
+                         <span class="purple">│       │          │</span>    <span class="cyan">└──────────────────┘</span>
+                         <span class="purple">│       ▼          │</span>
+                         <span class="purple">│   Internet       │</span>
+                         <span class="purple">│  (foreign exit)  │</span>
+                         <span class="purple">└──────────────────┘</span>
+</pre></div>
+
+<div class="note">
+  <b>How bypass works with V2Ray:</b> Xray sets <code>fwmark 0x2</code> on all outbound packets via <code>sockopt.mark</code>.
+  The nftables prerouting chain then checks: if destination IP is in the <code>@bypass</code> set (Iranian IPs),
+  it overrides the mark to <code>0x1</code>, which routes through the main table (direct exit).
+  Otherwise, mark stays <code>0x2</code> and routes through the tunnel.
+  <br><br>
+  <b>This means bypass already works for V2Ray</b> — as long as <code>IN.sh --bypass</code> is running.
+</div>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>3. User Sync Flow</h2>
+<div class="diagram"><pre>
+<span class="blue">┌──────────────┐</span>       SQL query          <span class="green">┌────────────────────┐</span>
+<span class="blue">│   MySQL DB   │</span>  ◄────────────────────  <span class="green">│  v2ray_sync.py     │</span>
+<span class="blue">│              │</span>                         <span class="green">│  (polls every 5s)  │</span>
+<span class="blue">│  users table │</span>  ────────────────────►  <span class="green">│                    │</span>
+<span class="blue">│  - username  │</span>  username + v2ray_uuid  <span class="green">│  Compares MD5 hash │</span>
+<span class="blue">│  - v2ray_uuid│</span>                         <span class="green">│  of user list      │</span>
+<span class="blue">└──────────────┘</span>                         <span class="green">└─────────┬──────────┘</span>
+                                                    │
+                                          ┌─────────┴──────────┐
+                                          │                    │
+                                     Changed?              No change
+                                          │                    │
+                                          ▼                    ▼
+                               <span class="yellow">┌─────────────────┐</span>    <span class="gray">Sleep 5s, repeat</span>
+                               <span class="yellow">│ Write config.json│</span>
+                               <span class="yellow">│ + usermap.json   │</span>
+                               <span class="yellow">│ + restart xray   │</span>
+                               <span class="yellow">└─────────────────┘</span>
+
+<span class="gray">Compare: wg_sync.py does the same for WireGuard (MySQL → wg set peer)</span>
+</pre></div>
+
+<h3>Generated Files</h3>
+<table>
+  <tr><th>File</th><th>Contents</th><th>Used By</th></tr>
+  <tr>
+    <td><code>/usr/local/etc/xray/config.json</code></td>
+    <td>Full Xray config: VLESS inbound, freedom outbound, stats API, routing rules, all user UUIDs</td>
+    <td>Xray service</td>
+  </tr>
+  <tr>
+    <td><code>/opt/v2ray_usermap.json</code></td>
+    <td>UUID ↔ username mapping cache</td>
+    <td>v2ray_online.py</td>
+  </tr>
+</table>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>4. Session Tracking</h2>
+<div class="diagram"><pre>
+<span class="green">┌─────────────────────────────────────────────────────────┐</span>
+<span class="green">│                    Xray Process                         │</span>
+<span class="green">│                                                         │</span>
+<span class="green">│  ┌─────────────────┐      ┌───────────────────────────┐ │</span>
+<span class="green">│  │  Stats API       │      │  access.log               │ │</span>
+<span class="green">│  │  :10085 (gRPC)   │      │  /var/log/xray/access.log │ │</span>
+<span class="green">│  │                  │      │                           │ │</span>
+<span class="green">│  │  Per-user:       │      │  Per-connection:          │ │</span>
+<span class="green">│  │  - upload bytes  │      │  - timestamp              │ │</span>
+<span class="green">│  │  - download bytes│      │  - source IP:port         │ │</span>
+<span class="green">│  │  (by email field)│      │  - destination            │ │</span>
+<span class="green">│  └────────┬────────┘      │  - email (username)       │ │</span>
+<span class="green">│           │               └───────────┬───────────────┘ │</span>
+<span class="green">└───────────┼───────────────────────────┼─────────────────┘</span>
+            │                           │
+            ▼                           ▼
+<span class="blue">┌───────────────────────────────────────────────────────┐</span>
+<span class="blue">│              v2ray_online.py                          │</span>
+<span class="blue">│                                                       │</span>
+<span class="blue">│  Stats API → bandwidth per user (upload/download)     │</span>
+<span class="blue">│  access.log → source IP + "online" detection          │</span>
+<span class="blue">│              (seen in last 30s = online)               │</span>
+<span class="blue">│                                                       │</span>
+<span class="blue">│  Combined output:                                     │</span>
+<span class="blue">│  ┌────────┬──────────┬─────────┬────────┬────────┐    │</span>
+<span class="blue">│  │ Status │ Username │ Src IP  │ Upload │Download│    │</span>
+<span class="blue">│  │ ● ON   │ amir     │2.144.x  │ 141 KB │ 493 KB │    │</span>
+<span class="blue">│  └────────┴──────────┴─────────┴────────┴────────┘    │</span>
+<span class="blue">└───────────────────────────────────────────────────────┘</span>
+</pre></div>
+
+<div class="note">
+  <b>Online detection:</b> Xray doesn't have a "connected users" concept like WireGuard handshakes.
+  A user is considered "online" if they appear in the access.log within the last 30 seconds.
+  When they disconnect, they fade out after 30s of no new connections.
+</div>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>5. Xray Config Structure</h2>
+<div class="diagram"><pre>
+<span class="yellow">config.json</span>
+├── <span class="blue">log</span>
+│   ├── access: /var/log/xray/access.log
+│   ├── error:  /var/log/xray/error.log
+│   └── loglevel: warning
+│
+├── <span class="blue">stats</span>: {}                          <span class="gray">← enables stats engine</span>
+│
+├── <span class="blue">api</span>
+│   ├── listen: 127.0.0.1:10085       <span class="gray">← loopback only</span>
+│   └── services: [StatsService, HandlerService]
+│
+├── <span class="blue">policy</span>
+│   └── levels.0
+│       ├── statsUserUplink: true      <span class="gray">← track upload per user</span>
+│       └── statsUserDownlink: true    <span class="gray">← track download per user</span>
+│
+├── <span class="blue">inbounds</span>[0]
+│   ├── tag: "vless-in"
+│   ├── port: 11042
+│   ├── protocol: "vless"
+│   ├── settings
+│   │   ├── decryption: "none"
+│   │   └── clients[]
+│   │       ├── {id: "uuid-1", <span class="highlight">email: "amir"</span>, level: 0}
+│   │       ├── {id: "uuid-2", <span class="highlight">email: "user2"</span>, level: 0}
+│   │       └── ... (5168 users)
+│   └── streamSettings
+│       ├── network: "tcp"
+│       ├── security: "none"           <span class="gray">← NO TLS, no cert needed</span>
+│       └── tcpSettings.header
+│           ├── type: "http"           <span class="gray">← HTTP obfuscation</span>
+│           └── request.headers.Host:
+│               ├── "bale.ai"          <span class="gray">← Iranian messaging apps</span>
+│               ├── "web.igap.net"     <span class="gray">   (anti-DPI camouflage)</span>
+│               └── "igap.net"
+│
+├── <span class="blue">outbounds</span>[0]
+│   ├── tag: "direct"
+│   ├── protocol: "freedom"
+│   └── streamSettings.sockopt
+│       └── <span class="highlight">mark: 2</span>                    <span class="gray">← fwmark 0x2 → tunnel routing</span>
+│
+├── <span class="blue">outbounds</span>[1]
+│   ├── tag: "blocked"
+│   └── protocol: "blackhole"
+│
+└── <span class="blue">routing</span>.rules[]
+    ├── inboundTag:["api"] → "api"     <span class="gray">← Stats API internal routing</span>
+    └── protocol:["bittorrent"] → "blocked"  <span class="gray">← block torrents</span>
+</pre></div>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>6. Mark-Based Routing: How All Protocols Share the Tunnel</h2>
+<div class="diagram"><pre>
+<span class="green">═══════════════════════════════════════════════════════════════════════</span>
+<span class="green">  PACKET MARKING (nftables prerouting, priority mangle)</span>
+<span class="green">═══════════════════════════════════════════════════════════════════════</span>
+
+  <span class="blue">VPN protocols (source-based marking):</span>
+  ┌─────────────────────────────────────────────────────┐
+  │  src 10.1.0.0/16  (WireGuard)  → mark 0x2          │
+  │  src 10.2.0.0/16  (OpenVPN TCP) → mark 0x2         │
+  │  src 10.3.0.0/16  (OpenVPN UDP) → mark 0x2         │
+  │  src 10.4.0.0/16  (IKEv2)      → mark 0x2          │
+  │  src 10.5.0.0/16  (ocserv)     → mark 0x2          │
+  │  src 10.6.0.0/16  (L2TP)       → mark 0x2          │
+  │  src 10.99.99.2   (server)     → mark 0x2          │
+  └─────────────────────────────────────────────────────┘
+
+  <span class="purple">V2RAY (socket-based marking — different!):</span>
+  ┌─────────────────────────────────────────────────────┐
+  │  Xray sets sockopt.mark = 2 on ALL outbound sockets │
+  │  Packets arrive in prerouting ALREADY marked 0x2    │
+  │  No source-based rule needed!                       │
+  └─────────────────────────────────────────────────────┘
+
+  <span class="yellow">Bypass override (runs AFTER source marks):</span>
+  ┌─────────────────────────────────────────────────────┐
+  │  if dst in @bypass (Iranian IPs):                   │
+  │    mark → 0x1  (overrides 0x2 → direct exit)        │
+  │                                                     │
+  │  Works for ALL protocols including V2RAY because    │
+  │  it checks destination, not source                  │
+  └─────────────────────────────────────────────────────┘
+
+<span class="green">═══════════════════════════════════════════════════════════════════════</span>
+<span class="green">  ROUTING DECISION (ip rule)</span>
+<span class="green">═══════════════════════════════════════════════════════════════════════</span>
+
+  Priority 50:  fwmark 0x2 → table "tunnel" → via 10.99.99.1 dev vrtun0
+  Priority 99:  fwmark 0x1 → table "main"   → via default gateway (direct)
+</pre></div>
+
+<div class="note note-info">
+  <b>V2RAY bypass works automatically!</b> Because Xray's <code>sockopt.mark: 2</code> sets the mark at socket level,
+  and the nftables bypass rule in prerouting checks <b>destination IP</b> (not source),
+  it correctly overrides mark to 0x1 for Iranian destinations. No extra configuration needed —
+  as long as <code>IN.sh --bypass</code> is running.
+</div>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>7. Services &amp; Files Map</h2>
+<div class="diagram"><pre>
+<span class="blue">Systemd Services:</span>
+  xray.service           → /usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+  v2ray-sync.service     → python3 /opt/v2ray_sync.py --loop --poll=5
+
+<span class="blue">Scripts:</span>
+  /opt/v2ray_sync.py     → MySQL → Xray config (user UUID sync)
+  /opt/v2ray_online.py   → Show online V2RAY users (Stats API + access.log)
+
+<span class="blue">Config Files:</span>
+  /usr/local/etc/xray/config.json  → Xray full config (generated by v2ray_sync.py)
+  /opt/v2ray_usermap.json          → UUID ↔ username cache
+  /opt/vroute.conf                 → server_ids.V2RAY = 800+N
+
+<span class="blue">Logs:</span>
+  /var/log/xray/access.log         → connection log (source IPs, emails)
+  /var/log/xray/error.log          → error log
+  journalctl -u xray               → Xray service log
+  journalctl -u v2ray-sync         → sync daemon log
+
+<span class="blue">Logrotate:</span>
+  /etc/logrotate.d/xray            → daily, 7 days, copytruncate
+</pre></div>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>8. V2RAY vs Other Protocols — Comparison</h2>
+<table>
+  <tr>
+    <th>Feature</th><th>WireGuard</th><th>OpenVPN</th><th>IKEv2</th><th>ocserv</th><th>L2TP</th><th style="background:#1c2128"><b>V2RAY</b></th>
+  </tr>
+  <tr>
+    <td>Type</td><td>Tunnel</td><td>Tunnel</td><td>Tunnel</td><td>Tunnel</td><td>Tunnel</td><td><b>Proxy</b></td>
+  </tr>
+  <tr>
+    <td>VPN IP assigned</td><td>Yes (10.1.x)</td><td>Yes (10.2/3.x)</td><td>Yes (10.4.x)</td><td>Yes (10.5.x)</td><td>Yes (10.6.x)</td><td><b>No</b></td>
+  </tr>
+  <tr>
+    <td>Auth method</td><td>DB sync</td><td>RADIUS</td><td>RADIUS EAP</td><td>RADIUS</td><td>RADIUS PPP</td><td><b>DB sync (UUID)</b></td>
+  </tr>
+  <tr>
+    <td>Sync daemon</td><td>wg_sync.py</td><td>N/A</td><td>N/A</td><td>N/A</td><td>N/A</td><td><b>v2ray_sync.py</b></td>
+  </tr>
+  <tr>
+    <td>Online detection</td><td>Handshake age</td><td>Mgmt socket</td><td>swanctl SAs</td><td>occtl JSON</td><td>/proc + pidfiles</td><td><b>access.log</b></td>
+  </tr>
+  <tr>
+    <td>Traffic stats</td><td>wg show</td><td>Mgmt socket</td><td>swanctl SAs</td><td>occtl JSON</td><td>/proc/net/dev</td><td><b>Stats API</b></td>
+  </tr>
+  <tr>
+    <td>Tunnel routing</td><td>Source mark</td><td>Source mark</td><td>Source mark</td><td>Source mark</td><td>Source mark</td><td><b>Socket mark</b></td>
+  </tr>
+  <tr>
+    <td>TLS/cert needed</td><td>No</td><td>Yes (self)</td><td>Yes (LE)</td><td>Yes (LE)</td><td>No (PSK)</td><td><b>No</b></td>
+  </tr>
+  <tr>
+    <td>Anti-DPI</td><td>No</td><td>No</td><td>No</td><td>No</td><td>No</td><td><b>HTTP obfuscation</b></td>
+  </tr>
+</table>
+</div>
+
+<!-- ============================================ -->
+<div class="section">
+<h2>9. VLESS Client URL Format</h2>
+<div class="diagram"><pre>
+vless://<span class="highlight">{UUID}</span>@<span class="blue">{SERVER_IP}</span>:<span class="green">11042</span>?encryption=none&security=none&type=tcp&headerType=http&path=/&host=bale.ai,web.igap.net,igap.net#<span class="purple">{SERVER_NAME}</span>
+
+<span class="gray">Example:</span>
+vless://<span class="highlight">fce3eb3f-11c3-11f1-9224-bc2411b8d103</span>@<span class="blue">87.107.55.52</span>:<span class="green">11042</span>?encryption=none&security=none&type=tcp&headerType=http&path=/&host=bale.ai,web.igap.net,igap.net#<span class="purple">VS17</span>
+
+<span class="gray">Parameters explained:</span>
+  encryption=none    → VLESS doesn't add encryption layer (relies on TLS or none)
+  security=none      → No TLS (plain TCP with HTTP obfuscation)
+  type=tcp           → TCP transport
+  headerType=http    → HTTP header camouflage
+  path=/             → HTTP request path
+  host=bale.ai,...   → Fake HTTP Host headers (anti-DPI)
+</pre></div>
+</div>
+
+</body>
+</html>
